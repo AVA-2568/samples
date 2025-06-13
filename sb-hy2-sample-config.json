@@ -1,0 +1,123 @@
+{
+  "inbounds": [
+    {
+      "type": "hysteria2",
+      "listen": "::",
+      "listen_port": 443,
+      "up_mbps": 800,
+      "down_mbps": 700,
+      "users": [
+        {
+          "name": "가가가가가가",
+          "password": "가가가가가가"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "가가가가가가",
+        "alpn": "h3",
+        "certificate": [
+          "-----BEGIN CERTIFICATE-----",
+          "가가가가가가",
+          "가가가가가가",
+          "-----END CERTIFICATE-----",
+          "-----BEGIN CERTIFICATE-----",
+          "가가가가가가",
+          "가가가가가가",
+          "-----END CERTIFICATE-----"
+        ],
+        "certificate_path": "/etc/가가가가가가/tls/가가가가가가",
+        "key": [
+          "-----BEGIN EC PRIVATE KEY-----",
+          "가가가가가가",
+          "가가가가가가",
+          "-----END EC PRIVATE KEY-----"
+        ],
+        "key_path": "/etc/가가가가가가/tls/가가가가가가"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct-out",
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "rule_set": "geoip-ir",
+        "rule_set_ipcidr_match_source": true,
+        "action": "reject"
+      },
+      {
+        "rule_set": "geoip-in",
+        "rule_set_ipcidr_match_source": true,
+        "action": "reject"
+      },
+      {
+        "rule_set": "geosite-cn",
+        "action": "reject"
+      },
+      {
+        "rule_set": "geosite-speedtest",
+        "action": "reject"
+      },
+      {
+        "rule_set": "geosite-pt",
+        "action": "reject"
+      },
+      {
+        "rule_set": "geosite-ads",
+        "action": "reject"
+      }
+    ],
+    "rule_set": [
+      {
+        "tag": "geoip-ir",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geoip/geoip-ir.srs"
+      },
+      {
+        "tag": "geoip-in",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geoip/geoip-in.srs"
+      },
+      {
+        "tag": "geosite-cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geosite/geosite-cn.srs"
+      },
+      {
+        "tag": "geosite-speedtest",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geosite/geosite-category-speedtest.srs"
+      },
+      {
+        "tag": "geosite-pt",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geosite/geosite-category-pt.srs"
+      },
+      {
+        "tag": "geosite-ads",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geosite/geosite-category-ads-all.srs"
+      }
+    ]
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true
+    }
+  }
+}
