@@ -40,14 +40,14 @@
   "outbounds": [
     {
       "type": "direct",
-      "tag": "direct-out",
+      "tag": "direct-out"
     }
   ],
   "route": {
     "rules": [
       {
         "ip_is_private": true,
-        "outbound": "direct"
+        "outbound": "direct-out"
       },
       {
         "rule_set": "geoip-ir",
