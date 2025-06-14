@@ -51,12 +51,10 @@
       },
       {
         "rule_set": "geoip-ir",
-        "rule_set_ipcidr_match_source": true,
         "action": "reject"
       },
       {
         "rule_set": "geoip-in",
-        "rule_set_ipcidr_match_source": true,
         "action": "reject"
       },
       {
