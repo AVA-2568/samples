@@ -117,7 +117,8 @@
   },
   "experimental": {
     "cache_file": {
-      "enabled": true
+      "enabled": true,
+      "path": "/etc/가가가가가가/sing-box/conf/cache/cache.db"
     }
   }
 }
