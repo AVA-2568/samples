@@ -4,7 +4,7 @@
     },
     "dns": {
         "servers": [
-          "https+local://8.8.8.8/dns-query", // 首选 1.1.1.1 的 DoH 查询，牺牲速度但可防止 ISP 偷窥
+          "https+local://8.8.8.8/dns-query",
           "localhost"
     ]
     },
@@ -68,3 +68,4 @@
     ]
 
 }
+
