@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-XMG_URL="${XMG_URL:-https://github.com/AVA-2568/samples/blob/main/xmg}"
+XMG_URL="${XMG_URL:-https://github.com/AVA-2568/samples/main/xmg}"
 XMG_BIN="/usr/local/bin/xmg"
 
 red() { echo -e "\033[31m$*\033[0m"; }
