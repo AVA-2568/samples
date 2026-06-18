@@ -1,4 +1,4 @@
 # samples
 一些配置案例，仅供学习
 
-bash <(curl -fsSL https://raw.githubusercontent.com/AVA-2568/samples/refs/heads/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/AVA-2568/samples/main/install.sh)
