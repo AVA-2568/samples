@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-XMG_VERSION="1.0.0"
+XMG_VERSION="1.1.0"
 
 BASE_DIR="/etc/xmg"
 STATE_FILE="$BASE_DIR/state.env"
 USERS_FILE="$BASE_DIR/users.json"
+
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
-XRAY_BIN="/usr/local/bin/xray"
+XRAY_LOCAL_WS_PORT="10001"
+XRAY_LOCAL_XHTTP_PORT="10002"
 
 WEB_BASE="/var/www/xmg"
 SITE_DIR="$WEB_BASE/site"
@@ -15,17 +17,13 @@ PANEL_DIR="$WEB_BASE/panel"
 SUB_DIR="$PANEL_DIR/sub"
 
 CADDYFILE="/etc/caddy/Caddyfile"
-
-XRAY_LOCAL_WS_PORT="10001"
-XRAY_LOCAL_XHTTP_PORT="10002"
+CADDY_CONF_DIR="/etc/caddy/conf.d"
+XMG_CADDYFILE="$CADDY_CONF_DIR/xmg.caddy"
+CADDY_CERT_DIR="/var/lib/caddy/.local/share/caddy/certificates"
 
 DEFAULT_REALITY_PORT="8443"
 DEFAULT_REALITY_SNI="www.microsoft.com"
 DEFAULT_REALITY_DEST="www.microsoft.com:443"
-
-DEFAULT_WS_PATH="/ws"
-DEFAULT_XHTTP_TLS_PATH="/xhttp"
-DEFAULT_REALITY_XHTTP_PATH="/reality"
 
 red() { echo -e "\033[31m$*\033[0m"; }
 green() { echo -e "\033[32m$*\033[0m"; }
@@ -37,18 +35,13 @@ pause() {
 }
 
 need_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    red "请使用 root 执行：sudo xmg"
-    exit 1
-  fi
+  [[ "${EUID}" -eq 0 ]] || { red "请使用 root 执行：sudo xmg"; exit 1; }
 }
 
 detect_os() {
-  if [[ ! -f /etc/os-release ]]; then
-    red "无法识别系统，仅支持 Debian / Ubuntu。"
-    exit 1
-  fi
+  [[ -f /etc/os-release ]] || { red "无法识别系统，仅支持 Debian / Ubuntu。"; exit 1; }
 
+  # shellcheck disable=SC1091
   . /etc/os-release
 
   case "${ID:-}" in
@@ -62,7 +55,7 @@ detect_os() {
 
 init_dirs() {
   mkdir -p "$BASE_DIR" "$WEB_BASE" "$SITE_DIR" "$PANEL_DIR" "$SUB_DIR"
-  chmod 0750 "$BASE_DIR"
+  chmod 0700 "$BASE_DIR"
 }
 
 random_token() {
@@ -70,7 +63,7 @@ random_token() {
 }
 
 random_path() {
-  echo "/$(openssl rand -hex 6)"
+  echo "/$(openssl rand -hex 10)"
 }
 
 gen_uuid() {
@@ -93,9 +86,9 @@ load_state() {
   : "${REALITY_PORT:=$DEFAULT_REALITY_PORT}"
   : "${REALITY_SNI:=$DEFAULT_REALITY_SNI}"
   : "${REALITY_DEST:=$DEFAULT_REALITY_DEST}"
-  : "${WS_PATH:=$DEFAULT_WS_PATH}"
-  : "${XHTTP_TLS_PATH:=$DEFAULT_XHTTP_TLS_PATH}"
-  : "${REALITY_XHTTP_PATH:=$DEFAULT_REALITY_XHTTP_PATH}"
+  : "${WS_PATH:=$(random_path)}"
+  : "${XHTTP_TLS_PATH:=$(random_path)}"
+  : "${REALITY_XHTTP_PATH:=$(random_path)}"
   : "${SUB_TOKEN:=$(random_token)}"
   : "${PANEL_USER:=admin}"
   : "${PANEL_PASS:=$(openssl rand -base64 18 | tr -d '=+/')}"
@@ -134,6 +127,7 @@ ensure_users_file() {
   if [[ ! -f "$USERS_FILE" ]]; then
     local uuid
     uuid="$(gen_uuid)"
+
     umask 077
     jq -n \
       --arg name "default" \
@@ -151,13 +145,14 @@ ensure_users_file() {
           }
         ]
       }' > "$USERS_FILE"
+
     chmod 0600 "$USERS_FILE"
   fi
 }
 
 require_domain() {
   if [[ -z "$DOMAIN" ]]; then
-    red "请先在菜单中设置域名。"
+    red "请先设置域名。"
     return 1
   fi
 }
@@ -172,12 +167,21 @@ require_xray() {
 install_base_deps() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y curl ca-certificates gnupg lsb-release jq openssl uuid-runtime git unzip tar cron ufw python3 debian-keyring debian-archive-keyring apt-transport-https
+  apt-get install -y \
+    curl ca-certificates gnupg lsb-release jq openssl uuid-runtime \
+    git unzip tar cron ufw python3 dnsutils iproute2 \
+    debian-keyring debian-archive-keyring apt-transport-https
 }
 
 install_xray() {
   install_base_deps
-  bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) install
+
+  local tmp
+  tmp="$(mktemp)"
+  curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$tmp"
+  bash "$tmp" install
+  rm -f "$tmp"
+
   systemctl enable xray
   green "Xray-core 安装/更新完成。"
 }
@@ -187,16 +191,96 @@ install_caddy() {
 
   if ! command -v caddy >/dev/null 2>&1; then
     install -d -m 0755 /etc/apt/keyrings
-    curl -fsSL "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" | gpg --dearmor -o /etc/apt/keyrings/caddy-stable-archive-keyring.gpg
-    chmod 0644 /etc/apt/keyrings/caddy-stable-archive-keyring.gpg
-    curl -fsSL "https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt" -o /etc/apt/sources.list.d/caddy-stable.list
+
+    if [[ ! -f /etc/apt/keyrings/caddy-stable-archive-keyring.gpg ]]; then
+      curl -fsSL "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" \
+        | gpg --dearmor -o /etc/apt/keyrings/caddy-stable-archive-keyring.gpg
+      chmod 0644 /etc/apt/keyrings/caddy-stable-archive-keyring.gpg
+    fi
+
+    curl -fsSL "https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt" \
+      -o /etc/apt/sources.list.d/caddy-stable.list
     chmod 0644 /etc/apt/sources.list.d/caddy-stable.list
+
     apt-get update -y
     apt-get install -y caddy
   fi
 
   systemctl enable caddy
   green "Caddy 安装/更新完成。"
+}
+
+port_in_use_by_allowed_service() {
+  local port="$1"
+  local allowed="$2"
+
+  ss -lntp 2>/dev/null | grep -E "[:.]${port}\b" | grep -Eq "$allowed"
+}
+
+check_port_free_or_owned() {
+  local port="$1"
+  local name="$2"
+  local allowed="$3"
+
+  if ! ss -lntp 2>/dev/null | grep -Eq "[:.]${port}\b"; then
+    return 0
+  fi
+
+  if port_in_use_by_allowed_service "$port" "$allowed"; then
+    yellow "端口 $port 已由预期服务占用：$name"
+    return 0
+  fi
+
+  red "端口被其他进程占用：$port / $name"
+  ss -lntp 2>/dev/null | grep -E "[:.]${port}\b" || true
+  return 1
+}
+
+preflight_ports() {
+  check_port_free_or_owned 80 "Caddy HTTP" "caddy"
+  check_port_free_or_owned 443 "Caddy HTTPS" "caddy"
+  check_port_free_or_owned "$REALITY_PORT" "Reality-XHTTP" "xray"
+  check_port_free_or_owned "$XRAY_LOCAL_WS_PORT" "Xray WS local" "xray"
+  check_port_free_or_owned "$XRAY_LOCAL_XHTTP_PORT" "Xray XHTTP local" "xray"
+}
+
+get_public_ipv4() {
+  curl -fs4 --max-time 5 https://api.ipify.org || true
+}
+
+get_public_ipv6() {
+  curl -fs6 --max-time 5 https://api64.ipify.org || true
+}
+
+check_domain_resolution() {
+  require_domain
+
+  local local_v4 local_v6 dns_a dns_aaaa ok
+  local_v4="$(get_public_ipv4)"
+  local_v6="$(get_public_ipv6)"
+  dns_a="$(dig +short A "$DOMAIN" 2>/dev/null || true)"
+  dns_aaaa="$(dig +short AAAA "$DOMAIN" 2>/dev/null || true)"
+  ok="0"
+
+  if [[ -n "$local_v4" ]] && grep -Fxq "$local_v4" <<< "$dns_a"; then
+    ok="1"
+  fi
+
+  if [[ -n "$local_v6" ]] && grep -Fxq "$local_v6" <<< "$dns_aaaa"; then
+    ok="1"
+  fi
+
+  if [[ "$ok" != "1" ]]; then
+    red "域名解析未指向本机，Caddy 自动 TLS 可能失败。"
+    echo "域名：$DOMAIN"
+    echo "本机 IPv4：${local_v4:-无}"
+    echo "DNS A：${dns_a:-无}"
+    echo "本机 IPv6：${local_v6:-无}"
+    echo "DNS AAAA：${dns_aaaa:-无}"
+    return 1
+  fi
+
+  green "域名解析检查通过：$DOMAIN"
 }
 
 gen_reality_keys() {
@@ -231,7 +315,7 @@ public_host_for_reality() {
   elif [[ -n "$DOMAIN" ]]; then
     echo "$DOMAIN"
   else
-    curl -fs4 https://api.ipify.org || echo "YOUR_SERVER_IP"
+    curl -fs4 --max-time 5 https://api.ipify.org || echo "YOUR_SERVER_IP"
   fi
 }
 
@@ -256,10 +340,12 @@ write_xray_config() {
   ensure_users_file
   gen_reality_keys
 
-  local reality_clients ws_clients xhttp_tls_clients
+  local reality_clients ws_clients xhttp_tls_clients tmp backup
   reality_clients="$(enabled_clients_json reality)"
   ws_clients="$(enabled_clients_json ws)"
   xhttp_tls_clients="$(enabled_clients_json xhttp_tls)"
+  tmp="$(mktemp)"
+  backup="${XRAY_CONFIG}.bak.$(date +%Y%m%d-%H%M%S)"
 
   mkdir -p "$(dirname "$XRAY_CONFIG")"
 
@@ -400,15 +486,36 @@ write_xray_config() {
           }
         }
       }
-    }' > "$XRAY_CONFIG"
+    }' > "$tmp"
 
-  xray test -config "$XRAY_CONFIG"
-  systemctl restart xray
+  xray test -config "$tmp"
+
+  if [[ -f "$XRAY_CONFIG" ]]; then
+    cp "$XRAY_CONFIG" "$backup"
+  fi
+
+  install -m 0644 "$tmp" "$XRAY_CONFIG"
+  rm -f "$tmp"
+
+  if ! systemctl restart xray; then
+    red "Xray 重启失败，尝试回滚配置。"
+    if [[ -f "$backup" ]]; then
+      cp "$backup" "$XRAY_CONFIG"
+      systemctl restart xray || true
+    fi
+    return 1
+  fi
+
   green "Xray 配置已生成并重启。"
 }
 
 install_default_site() {
   mkdir -p "$SITE_DIR"
+
+  if [[ -f "$SITE_DIR/index.html" ]]; then
+    return 0
+  fi
+
   cat > "$SITE_DIR/index.html" <<'EOF'
 <!doctype html>
 <html lang="en">
@@ -463,27 +570,44 @@ pull_site_from_github() {
   green "伪装站已部署到 $SITE_DIR"
 }
 
-caddy_hash_password() {
-  caddy hash-password --plaintext "$PANEL_PASS"
-}
+ensure_caddy_import() {
+  mkdir -p "$CADDY_CONF_DIR"
 
-write_caddyfile() {
-  require_domain
-  install_default_site
-
-  local hashed_pass
-  hashed_pass="$(caddy_hash_password)"
-
-  mkdir -p /etc/caddy
-
-  cat > "$CADDYFILE" <<EOF
+  if [[ ! -f "$CADDYFILE" ]]; then
+    cat > "$CADDYFILE" <<EOF
 {
-	email ${EMAIL:-admin@$DOMAIN}
+	email ${EMAIL:-admin@example.com}
 	servers {
 		protocols h1 h2 h3
 	}
 }
 
+import /etc/caddy/conf.d/*.caddy
+EOF
+    return 0
+  fi
+
+  if ! grep -q 'import /etc/caddy/conf.d/\*.caddy' "$CADDYFILE"; then
+    cp "$CADDYFILE" "$CADDYFILE.bak.$(date +%Y%m%d-%H%M%S)"
+    cat >> "$CADDYFILE" <<'EOF'
+
+import /etc/caddy/conf.d/*.caddy
+EOF
+  fi
+}
+
+write_caddyfile() {
+  require_domain
+  check_domain_resolution
+  install_default_site
+  ensure_caddy_import
+
+  local hashed_pass tmp backup
+  hashed_pass="$(caddy hash-password --plaintext "$PANEL_PASS")"
+  tmp="$(mktemp)"
+  backup="${XMG_CADDYFILE}.bak.$(date +%Y%m%d-%H%M%S)"
+
+  cat > "$tmp" <<EOF
 $DOMAIN {
 	encode zstd gzip
 
@@ -518,9 +642,26 @@ $DOMAIN {
 }
 EOF
 
-  caddy validate --config "$CADDYFILE"
-  systemctl reload caddy || systemctl restart caddy
-  green "Caddy 配置已生成并重载。"
+  if [[ -f "$XMG_CADDYFILE" ]]; then
+    cp "$XMG_CADDYFILE" "$backup"
+  fi
+
+  install -m 0644 "$tmp" "$XMG_CADDYFILE"
+  rm -f "$tmp"
+
+  if ! caddy validate --config "$CADDYFILE"; then
+    red "Caddy 配置校验失败，尝试回滚。"
+    if [[ -f "$backup" ]]; then
+      cp "$backup" "$XMG_CADDYFILE"
+    fi
+    return 1
+  fi
+
+  if ! systemctl reload caddy; then
+    systemctl restart caddy
+  fi
+
+  green "Caddy 分层配置已生成：$XMG_CADDYFILE"
 }
 
 setup_firewall() {
@@ -528,13 +669,16 @@ setup_firewall() {
     apt-get install -y ufw
   fi
 
+  yellow "即将放行 80/tcp、443/tcp、Reality 端口 $REALITY_PORT/tcp。"
+  yellow "如你的 SSH 不是 22 端口，请先确保已手动放行。"
+
   ufw allow 22/tcp || true
   ufw allow 80/tcp || true
   ufw allow 443/tcp || true
   ufw allow "$REALITY_PORT/tcp" || true
   ufw --force enable || true
 
-  green "防火墙已放行 22、80、443、Reality 端口 $REALITY_PORT。"
+  green "防火墙规则已应用。"
 }
 
 set_basic_info() {
@@ -549,13 +693,16 @@ set_basic_info() {
   REALITY_SNI="${input_reality_sni:-$REALITY_SNI}"
   REALITY_DEST="${REALITY_SNI}:443"
 
-  read -rp "WS 路径，默认 $WS_PATH: " input_ws_path
+  echo "WS 随机路径：$WS_PATH"
+  read -rp "WS 路径，回车保持当前值: " input_ws_path
   WS_PATH="${input_ws_path:-$WS_PATH}"
 
-  read -rp "XHTTP TLS 路径，默认 $XHTTP_TLS_PATH: " input_xhttp_tls_path
+  echo "XHTTP-TLS 随机路径：$XHTTP_TLS_PATH"
+  read -rp "XHTTP-TLS 路径，回车保持当前值: " input_xhttp_tls_path
   XHTTP_TLS_PATH="${input_xhttp_tls_path:-$XHTTP_TLS_PATH}"
 
-  read -rp "Reality XHTTP 路径，默认 $REALITY_XHTTP_PATH: " input_reality_xhttp_path
+  echo "Reality-XHTTP 随机路径：$REALITY_XHTTP_PATH"
+  read -rp "Reality-XHTTP 路径，回车保持当前值: " input_reality_xhttp_path
   REALITY_XHTTP_PATH="${input_reality_xhttp_path:-$REALITY_XHTTP_PATH}"
 
   if [[ "$WS_PATH" != /* || "$XHTTP_TLS_PATH" != /* || "$REALITY_XHTTP_PATH" != /* ]]; then
@@ -570,7 +717,7 @@ set_basic_info() {
 add_user() {
   ensure_users_file
 
-  local name uuid
+  local name uuid reality ws xhttp_tls tmp
   read -rp "用户名称，例如 alice: " name
 
   if [[ -z "$name" ]]; then
@@ -585,7 +732,6 @@ add_user() {
 
   uuid="$(gen_uuid)"
 
-  local reality ws xhttp_tls
   read -rp "启用 Reality-XHTTP? [Y/n]: " reality
   read -rp "启用 WS-TLS? [Y/n]: " ws
   read -rp "启用 XHTTP-TLS? [Y/n]: " xhttp_tls
@@ -594,7 +740,6 @@ add_user() {
   ws="$([[ "${ws,,}" == "n" ]] && echo false || echo true)"
   xhttp_tls="$([[ "${xhttp_tls,,}" == "n" ]] && echo false || echo true)"
 
-  local tmp
   tmp="$(mktemp)"
   jq \
     --arg name "$name" \
@@ -624,7 +769,7 @@ delete_user() {
   ensure_users_file
   jq -r '.users[] | "\(.name)\t\(.uuid)\tenabled=\(.enabled)"' "$USERS_FILE"
 
-  local name
+  local name tmp
   read -rp "请输入要删除的用户名称: " name
 
   if [[ -z "$name" ]]; then
@@ -632,7 +777,6 @@ delete_user() {
     return 1
   fi
 
-  local tmp
   tmp="$(mktemp)"
   jq --arg name "$name" '.users = [.users[] | select(.name != $name)]' "$USERS_FILE" > "$tmp"
   mv "$tmp" "$USERS_FILE"
@@ -647,10 +791,9 @@ toggle_user() {
   ensure_users_file
   jq -r '.users[] | "\(.name)\t\(.uuid)\tenabled=\(.enabled)"' "$USERS_FILE"
 
-  local name
+  local name tmp
   read -rp "请输入用户名称: " name
 
-  local tmp
   tmp="$(mktemp)"
   jq --arg name "$name" '
     .users = [
@@ -658,6 +801,7 @@ toggle_user() {
       | if .name == $name then .enabled = (.enabled | not) else . end
     ]
   ' "$USERS_FILE" > "$tmp"
+
   mv "$tmp" "$USERS_FILE"
   chmod 0600 "$USERS_FILE"
 
@@ -681,10 +825,10 @@ change_ports_paths() {
   read -rp "WS 路径，当前 $WS_PATH: " input_ws_path
   WS_PATH="${input_ws_path:-$WS_PATH}"
 
-  read -rp "XHTTP TLS 路径，当前 $XHTTP_TLS_PATH: " input_xhttp_tls_path
+  read -rp "XHTTP-TLS 路径，当前 $XHTTP_TLS_PATH: " input_xhttp_tls_path
   XHTTP_TLS_PATH="${input_xhttp_tls_path:-$XHTTP_TLS_PATH}"
 
-  read -rp "Reality XHTTP 路径，当前 $REALITY_XHTTP_PATH: " input_reality_xhttp_path
+  read -rp "Reality-XHTTP 路径，当前 $REALITY_XHTTP_PATH: " input_reality_xhttp_path
   REALITY_XHTTP_PATH="${input_reality_xhttp_path:-$REALITY_XHTTP_PATH}"
 
   if [[ "$WS_PATH" != /* || "$XHTTP_TLS_PATH" != /* || "$REALITY_XHTTP_PATH" != /* ]]; then
@@ -692,6 +836,7 @@ change_ports_paths() {
     return 1
   fi
 
+  preflight_ports
   save_state
   write_xray_config
   write_caddyfile
@@ -735,33 +880,39 @@ build_subscriptions() {
   gen_reality_keys || true
 
   mkdir -p "$SUB_DIR"
-  : > "$SUB_DIR/all.txt"
-  : > "$SUB_DIR/reality.txt"
-  : > "$SUB_DIR/ws.txt"
-  : > "$SUB_DIR/xhttp-tls.txt"
+  rm -f "$SUB_DIR"/*.txt "$SUB_DIR"/*.b64
+
+  local tmp_all tmp_reality tmp_ws tmp_xhttp
+  tmp_all="$(mktemp)"
+  tmp_reality="$(mktemp)"
+  tmp_ws="$(mktemp)"
+  tmp_xhttp="$(mktemp)"
 
   while IFS=$'\t' read -r name uuid reality ws xhttp_tls; do
     if [[ "$reality" == "true" ]]; then
-      link_reality "$name" "$uuid" | tee -a "$SUB_DIR/reality.txt" >> "$SUB_DIR/all.txt"
+      link_reality "$name" "$uuid" | tee -a "$tmp_reality" >> "$tmp_all"
     fi
 
     if [[ -n "$DOMAIN" && "$ws" == "true" ]]; then
-      link_ws_tls "$name" "$uuid" | tee -a "$SUB_DIR/ws.txt" >> "$SUB_DIR/all.txt"
+      link_ws_tls "$name" "$uuid" | tee -a "$tmp_ws" >> "$tmp_all"
     fi
 
     if [[ -n "$DOMAIN" && "$xhttp_tls" == "true" ]]; then
-      link_xhttp_tls "$name" "$uuid" | tee -a "$SUB_DIR/xhttp-tls.txt" >> "$SUB_DIR/all.txt"
+      link_xhttp_tls "$name" "$uuid" | tee -a "$tmp_xhttp" >> "$tmp_all"
     fi
   done < <(jq -r '.users[] | select(.enabled == true) | [.name, .uuid, .reality, .ws, .xhttp_tls] | @tsv' "$USERS_FILE")
 
-  base64 -w 0 "$SUB_DIR/all.txt" > "$SUB_DIR/all.b64"
-  base64 -w 0 "$SUB_DIR/reality.txt" > "$SUB_DIR/reality.b64"
-  base64 -w 0 "$SUB_DIR/ws.txt" > "$SUB_DIR/ws.b64"
-  base64 -w 0 "$SUB_DIR/xhttp-tls.txt" > "$SUB_DIR/xhttp-tls.b64"
+  base64 -w 0 "$tmp_all" > "$SUB_DIR/all.b64"
+  base64 -w 0 "$tmp_reality" > "$SUB_DIR/reality.b64"
+  base64 -w 0 "$tmp_ws" > "$SUB_DIR/ws.b64"
+  base64 -w 0 "$tmp_xhttp" > "$SUB_DIR/xhttp-tls.b64"
+
+  rm -f "$tmp_all" "$tmp_reality" "$tmp_ws" "$tmp_xhttp"
+  chmod 0640 "$SUB_DIR"/*.b64
 
   write_panel_html
 
-  green "订阅已生成："
+  green "Base64 订阅已生成："
   if [[ -n "$DOMAIN" ]]; then
     echo "面板：https://$DOMAIN/$SUB_TOKEN/"
     echo "All：https://$DOMAIN/$SUB_TOKEN/sub/all.b64"
@@ -771,7 +922,7 @@ build_subscriptions() {
     echo "面板账号：$PANEL_USER"
     echo "面板密码：$PANEL_PASS"
   else
-    echo "未设置域名，TLS 订阅链接暂不可用。"
+    yellow "未设置域名，HTTPS 订阅链接暂不可用。"
   fi
 }
 
@@ -855,14 +1006,17 @@ show_links_for_user() {
   ' "$USERS_FILE" | while IFS=$'\t' read -r uname uuid reality ws xhttp_tls; do
     echo
     blue "用户：$uname"
+
     if [[ "$reality" == "true" ]]; then
       echo "Reality-XHTTP:"
       link_reality "$uname" "$uuid"
     fi
+
     if [[ -n "$DOMAIN" && "$ws" == "true" ]]; then
       echo "WS-TLS:"
       link_ws_tls "$uname" "$uuid"
     fi
+
     if [[ -n "$DOMAIN" && "$xhttp_tls" == "true" ]]; then
       echo "XHTTP-TLS:"
       link_xhttp_tls "$uname" "$uuid"
@@ -870,10 +1024,137 @@ show_links_for_user() {
   done
 }
 
+cert_status() {
+  require_domain || return 1
+
+  local cert
+  cert="$(find "$CADDY_CERT_DIR" -type f -name "${DOMAIN}.crt" 2>/dev/null | head -n1 || true)"
+
+  if [[ -z "$cert" ]]; then
+    yellow "未找到 Caddy 证书，可能尚未成功签发：$DOMAIN"
+    return 1
+  fi
+
+  echo "证书文件：$cert"
+  openssl x509 -in "$cert" -noout -subject -issuer -dates
+
+  local end_epoch now_epoch left_days
+  end_epoch="$(openssl x509 -in "$cert" -noout -enddate | cut -d= -f2 | xargs -I{} date -d "{}" +%s)"
+  now_epoch="$(date +%s)"
+  left_days="$(( (end_epoch - now_epoch) / 86400 ))"
+
+  if (( left_days < 15 )); then
+    red "证书剩余天数较少：${left_days} 天"
+    return 1
+  fi
+
+  green "证书状态正常，剩余约 ${left_days} 天。"
+}
+
+doctor() {
+  local failed=0
+
+  echo "== XMG Doctor =="
+
+  echo
+  echo "[1] Xray 配置检查"
+  if [[ -f "$XRAY_CONFIG" ]] && command -v xray >/dev/null 2>&1 && xray test -config "$XRAY_CONFIG"; then
+    green "Xray 配置正常"
+  else
+    red "Xray 配置异常"
+    failed=1
+  fi
+
+  echo
+  echo "[2] Caddy 配置检查"
+  if [[ -f "$CADDYFILE" ]] && command -v caddy >/dev/null 2>&1 && caddy validate --config "$CADDYFILE"; then
+    green "Caddy 配置正常"
+  else
+    red "Caddy 配置异常"
+    failed=1
+  fi
+
+  echo
+  echo "[3] 服务状态"
+  if systemctl is-active --quiet xray; then
+    green "Xray 运行中"
+  else
+    red "Xray 未运行"
+    failed=1
+  fi
+
+  if systemctl is-active --quiet caddy; then
+    green "Caddy 运行中"
+  else
+    red "Caddy 未运行"
+    failed=1
+  fi
+
+  echo
+  echo "[4] 端口监听"
+  if ss -lntp | grep -E "(:80|:443|:${REALITY_PORT}|:${XRAY_LOCAL_WS_PORT}|:${XRAY_LOCAL_XHTTP_PORT})\b"; then
+    green "端口监听检查完成"
+  else
+    red "关键端口未完整监听"
+    failed=1
+  fi
+
+  echo
+  echo "[5] 域名解析"
+  if [[ -n "$DOMAIN" ]]; then
+    check_domain_resolution || failed=1
+  else
+    yellow "未设置域名，跳过"
+  fi
+
+  echo
+  echo "[6] 证书状态"
+  cert_status || failed=1
+
+  return "$failed"
+}
+
+install_health_service() {
+  cat > /usr/local/bin/xmg-health <<'EOF'
+#!/usr/bin/env bash
+exec /usr/local/bin/xmg doctor
+EOF
+  chmod 0755 /usr/local/bin/xmg-health
+
+  cat > /etc/systemd/system/xmg-health.service <<'EOF'
+[Unit]
+Description=XMG Health Check
+After=network-online.target xray.service caddy.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xmg-health
+EOF
+
+  cat > /etc/systemd/system/xmg-health.timer <<'EOF'
+[Unit]
+Description=Run XMG Health Check Periodically
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=30min
+Unit=xmg-health.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now xmg-health.timer
+  green "systemd 健康检查已启用：xmg-health.timer"
+}
+
 install_all() {
   set_basic_info
   install_xray
   install_caddy
+  preflight_ports
   ensure_users_file
   gen_reality_keys
   install_default_site
@@ -881,6 +1162,7 @@ install_all() {
   write_caddyfile
   setup_firewall
   build_subscriptions
+  install_health_service
 
   green "初始化完成。"
   echo "执行 xmg 可再次进入管理面板。"
@@ -889,6 +1171,7 @@ install_all() {
 update_all() {
   install_xray
   install_caddy
+  preflight_ports
   write_xray_config
   write_caddyfile
   build_subscriptions
@@ -900,9 +1183,10 @@ show_status() {
   echo "域名：${DOMAIN:-未设置}"
   echo "Reality 端口：$REALITY_PORT"
   echo "WS 路径：$WS_PATH"
-  echo "XHTTP TLS 路径：$XHTTP_TLS_PATH"
-  echo "Reality XHTTP 路径：$REALITY_XHTTP_PATH"
+  echo "XHTTP-TLS 路径：$XHTTP_TLS_PATH"
+  echo "Reality-XHTTP 路径：$REALITY_XHTTP_PATH"
   echo "订阅 Token：$SUB_TOKEN"
+  echo "Caddy 分层配置：$XMG_CADDYFILE"
   echo
 
   systemctl status xray --no-pager -l || true
@@ -915,17 +1199,20 @@ show_status() {
 view_logs() {
   echo "1. Xray 日志"
   echo "2. Caddy 日志"
+  echo "3. XMG 健康检查日志"
   read -rp "请选择: " choice
 
   case "$choice" in
     1) journalctl -u xray -e --no-pager ;;
     2) journalctl -u caddy -e --no-pager ;;
+    3) journalctl -u xmg-health -e --no-pager ;;
     *) red "无效选择" ;;
   esac
 }
 
 restart_services() {
   xray test -config "$XRAY_CONFIG"
+  caddy validate --config "$CADDYFILE"
   systemctl restart xray
   systemctl reload caddy || systemctl restart caddy
   green "服务已重启。"
@@ -933,32 +1220,9 @@ restart_services() {
 
 backup_config() {
   local backup="/root/xmg-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-  tar -czf "$backup" "$BASE_DIR" "$XRAY_CONFIG" "$CADDYFILE" "$WEB_BASE" 2>/dev/null || true
+  tar -czf "$backup" "$BASE_DIR" "$XRAY_CONFIG" "$CADDYFILE" "$CADDY_CONF_DIR" "$WEB_BASE" 2>/dev/null || true
   chmod 0600 "$backup"
   green "备份完成：$backup"
-}
-
-uninstall_xmg() {
-  yellow "此操作会卸载 XMG 配置，可选择是否卸载 Xray/Caddy。"
-  read -rp "确认继续？输入 YES: " confirm
-  [[ "$confirm" == "YES" ]] || return 0
-
-  systemctl stop xray caddy 2>/dev/null || true
-
-  read -rp "是否删除 Xray-core？[y/N]: " remove_xray
-  if [[ "${remove_xray,,}" == "y" ]]; then
-    bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) remove --purge || true
-  fi
-
-  read -rp "是否删除 Caddy？[y/N]: " remove_caddy
-  if [[ "${remove_caddy,,}" == "y" ]]; then
-    apt-get purge -y caddy || true
-  fi
-
-  rm -rf "$BASE_DIR" "$WEB_BASE"
-  rm -f /usr/local/bin/xmg
-
-  green "卸载完成。"
 }
 
 security_check() {
@@ -971,6 +1235,40 @@ security_check() {
   echo "- 防火墙：$(ufw status 2>/dev/null | head -n1 || echo 未安装)"
   echo "- 开放端口："
   ss -lntp | awk 'NR==1 || /:80|:443|:8443|:10001|:10002/'
+}
+
+uninstall_xmg() {
+  yellow "此操作会卸载 XMG 配置，可选择是否卸载 Xray/Caddy。"
+  read -rp "确认继续？输入 YES: " confirm
+  [[ "$confirm" == "YES" ]] || return 0
+
+  backup_config || true
+
+  systemctl disable --now xmg-health.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/xmg-health.service /etc/systemd/system/xmg-health.timer /usr/local/bin/xmg-health
+  systemctl daemon-reload || true
+
+  systemctl stop xray caddy 2>/dev/null || true
+
+  read -rp "是否删除 Xray-core？[y/N]: " remove_xray
+  if [[ "${remove_xray,,}" == "y" ]]; then
+    local tmp
+    tmp="$(mktemp)"
+    curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$tmp"
+    bash "$tmp" remove --purge || true
+    rm -f "$tmp"
+  fi
+
+  read -rp "是否删除 Caddy？[y/N]: " remove_caddy
+  if [[ "${remove_caddy,,}" == "y" ]]; then
+    apt-get purge -y caddy || true
+  fi
+
+  rm -rf "$BASE_DIR" "$WEB_BASE"
+  rm -f "$XMG_CADDYFILE"
+  rm -f /usr/local/bin/xmg
+
+  green "卸载完成。"
 }
 
 menu() {
@@ -998,6 +1296,9 @@ menu() {
   echo "19. 备份配置"
   echo "20. 安全检查"
   echo "21. 更新全部组件"
+  echo "22. 安装 systemd 健康检查"
+  echo "23. 执行 doctor 检查"
+  echo "24. 查看证书状态"
   echo "99. 卸载"
   echo "0.  退出"
   echo
@@ -1030,6 +1331,9 @@ main_loop() {
       19) backup_config; pause ;;
       20) security_check; pause ;;
       21) update_all; pause ;;
+      22) install_health_service; pause ;;
+      23) doctor; pause ;;
+      24) cert_status; pause ;;
       99) uninstall_xmg; exit 0 ;;
       0) exit 0 ;;
       *) red "无效选项"; pause ;;
@@ -1045,25 +1349,36 @@ main() {
   save_state
   ensure_users_file
 
-  if [[ "${1:-}" == "install" ]]; then
-    install_all
-    exit 0
-  fi
-
-  if [[ "${1:-}" == "status" ]]; then
-    show_status
-    exit 0
-  fi
-
-  if [[ "${1:-}" == "links" ]]; then
-    show_links_for_user
-    exit 0
-  fi
-
-  if [[ "${1:-}" == "sub" ]]; then
-    build_subscriptions
-    exit 0
-  fi
+  case "${1:-}" in
+    install)
+      install_all
+      exit 0
+      ;;
+    status)
+      show_status
+      exit 0
+      ;;
+    links)
+      show_links_for_user
+      exit 0
+      ;;
+    sub)
+      build_subscriptions
+      exit 0
+      ;;
+    doctor)
+      doctor
+      exit $?
+      ;;
+    cert)
+      cert_status
+      exit $?
+      ;;
+    health-install)
+      install_health_service
+      exit 0
+      ;;
+  esac
 
   main_loop
 }
