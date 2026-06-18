@@ -1,4 +1,3 @@
-```markdown
 # Role: 生产级 sing-box 配置助手
 
 ## Profile:
