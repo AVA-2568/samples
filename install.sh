@@ -6,21 +6,15 @@ XMG_BIN="/usr/local/bin/xmg"
 
 red() { echo -e "\033[31m$*\033[0m"; }
 green() { echo -e "\033[32m$*\033[0m"; }
-yellow() { echo -e "\033[33m$*\033[0m"; }
 
 need_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    red "请使用 root 执行安装。"
-    exit 1
-  fi
+  [[ "${EUID}" -eq 0 ]] || { red "请使用 root 执行安装。"; exit 1; }
 }
 
 detect_os() {
-  if [[ ! -f /etc/os-release ]]; then
-    red "无法识别系统，仅支持 Debian / Ubuntu。"
-    exit 1
-  fi
+  [[ -f /etc/os-release ]] || { red "无法识别系统，仅支持 Debian / Ubuntu。"; exit 1; }
 
+  # shellcheck disable=SC1091
   . /etc/os-release
 
   case "${ID:-}" in
@@ -28,16 +22,18 @@ detect_os() {
       green "检测到系统：${PRETTY_NAME:-$ID}"
       ;;
     *)
-      red "当前系统 ${ID:-unknown} 不受支持，仅支持 Debian / Ubuntu。"
+      red "仅支持 Debian / Ubuntu，当前：${ID:-unknown}"
       exit 1
       ;;
   esac
 }
 
-install_base_deps() {
+install_deps() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y curl ca-certificates gnupg lsb-release jq openssl uuid-runtime git unzip tar cron ufw python3
+  apt-get install -y \
+    curl ca-certificates gnupg lsb-release jq openssl uuid-runtime \
+    git unzip tar cron ufw python3 dnsutils iproute2
 }
 
 install_xmg() {
@@ -49,11 +45,9 @@ install_xmg() {
 main() {
   need_root
   detect_os
-  install_base_deps
+  install_deps
   install_xmg
-
-  green "安装完成。"
-  yellow "请执行：xmg"
+  green "安装完成，请执行：xmg"
 }
 
 main "$@"
