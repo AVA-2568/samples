@@ -1,1 +1,1071 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
+XMG_VERSION="1.0.0"
+
+BASE_DIR="/etc/xmg"
+STATE_FILE="$BASE_DIR/state.env"
+USERS_FILE="$BASE_DIR/users.json"
+XRAY_CONFIG="/usr/local/etc/xray/config.json"
+XRAY_BIN="/usr/local/bin/xray"
+
+WEB_BASE="/var/www/xmg"
+SITE_DIR="$WEB_BASE/site"
+PANEL_DIR="$WEB_BASE/panel"
+SUB_DIR="$PANEL_DIR/sub"
+
+CADDYFILE="/etc/caddy/Caddyfile"
+
+XRAY_LOCAL_WS_PORT="10001"
+XRAY_LOCAL_XHTTP_PORT="10002"
+
+DEFAULT_REALITY_PORT="8443"
+DEFAULT_REALITY_SNI="www.microsoft.com"
+DEFAULT_REALITY_DEST="www.microsoft.com:443"
+
+DEFAULT_WS_PATH="/ws"
+DEFAULT_XHTTP_TLS_PATH="/xhttp"
+DEFAULT_REALITY_XHTTP_PATH="/reality"
+
+red() { echo -e "\033[31m$*\033[0m"; }
+green() { echo -e "\033[32m$*\033[0m"; }
+yellow() { echo -e "\033[33m$*\033[0m"; }
+blue() { echo -e "\033[34m$*\033[0m"; }
+
+pause() {
+  read -rp "按 Enter 返回菜单..."
+}
+
+need_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    red "请使用 root 执行：sudo xmg"
+    exit 1
+  fi
+}
+
+detect_os() {
+  if [[ ! -f /etc/os-release ]]; then
+    red "无法识别系统，仅支持 Debian / Ubuntu。"
+    exit 1
+  fi
+
+  . /etc/os-release
+
+  case "${ID:-}" in
+    debian|ubuntu) ;;
+    *)
+      red "当前系统 ${ID:-unknown} 不受支持，仅支持 Debian / Ubuntu。"
+      exit 1
+      ;;
+  esac
+}
+
+init_dirs() {
+  mkdir -p "$BASE_DIR" "$WEB_BASE" "$SITE_DIR" "$PANEL_DIR" "$SUB_DIR"
+  chmod 0750 "$BASE_DIR"
+}
+
+random_token() {
+  openssl rand -hex 16
+}
+
+random_path() {
+  echo "/$(openssl rand -hex 6)"
+}
+
+gen_uuid() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen
+  else
+    cat /proc/sys/kernel/random/uuid
+  fi
+}
+
+load_state() {
+  if [[ -f "$STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+  fi
+
+  : "${DOMAIN:=}"
+  : "${EMAIL:=}"
+  : "${PUBLIC_HOST:=}"
+  : "${REALITY_PORT:=$DEFAULT_REALITY_PORT}"
+  : "${REALITY_SNI:=$DEFAULT_REALITY_SNI}"
+  : "${REALITY_DEST:=$DEFAULT_REALITY_DEST}"
+  : "${WS_PATH:=$DEFAULT_WS_PATH}"
+  : "${XHTTP_TLS_PATH:=$DEFAULT_XHTTP_TLS_PATH}"
+  : "${REALITY_XHTTP_PATH:=$DEFAULT_REALITY_XHTTP_PATH}"
+  : "${SUB_TOKEN:=$(random_token)}"
+  : "${PANEL_USER:=admin}"
+  : "${PANEL_PASS:=$(openssl rand -base64 18 | tr -d '=+/')}"
+  : "${REALITY_PRIVATE_KEY:=}"
+  : "${REALITY_PUBLIC_KEY:=}"
+  : "${REALITY_SHORT_ID:=}"
+  : "${SITE_REPO:=}"
+  : "${SITE_BRANCH:=main}"
+}
+
+save_state() {
+  umask 077
+  cat > "$STATE_FILE" <<EOF
+DOMAIN="$DOMAIN"
+EMAIL="$EMAIL"
+PUBLIC_HOST="$PUBLIC_HOST"
+REALITY_PORT="$REALITY_PORT"
+REALITY_SNI="$REALITY_SNI"
+REALITY_DEST="$REALITY_DEST"
+WS_PATH="$WS_PATH"
+XHTTP_TLS_PATH="$XHTTP_TLS_PATH"
+REALITY_XHTTP_PATH="$REALITY_XHTTP_PATH"
+SUB_TOKEN="$SUB_TOKEN"
+PANEL_USER="$PANEL_USER"
+PANEL_PASS="$PANEL_PASS"
+REALITY_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
+REALITY_PUBLIC_KEY="$REALITY_PUBLIC_KEY"
+REALITY_SHORT_ID="$REALITY_SHORT_ID"
+SITE_REPO="$SITE_REPO"
+SITE_BRANCH="$SITE_BRANCH"
+EOF
+  chmod 0600 "$STATE_FILE"
+}
+
+ensure_users_file() {
+  if [[ ! -f "$USERS_FILE" ]]; then
+    local uuid
+    uuid="$(gen_uuid)"
+    umask 077
+    jq -n \
+      --arg name "default" \
+      --arg uuid "$uuid" \
+      '{
+        users: [
+          {
+            name: $name,
+            uuid: $uuid,
+            enabled: true,
+            reality: true,
+            ws: true,
+            xhttp_tls: true,
+            created_at: now | todate
+          }
+        ]
+      }' > "$USERS_FILE"
+    chmod 0600 "$USERS_FILE"
+  fi
+}
+
+require_domain() {
+  if [[ -z "$DOMAIN" ]]; then
+    red "请先在菜单中设置域名。"
+    return 1
+  fi
+}
+
+require_xray() {
+  if ! command -v xray >/dev/null 2>&1; then
+    red "Xray-core 未安装，请先执行安装。"
+    return 1
+  fi
+}
+
+install_base_deps() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y curl ca-certificates gnupg lsb-release jq openssl uuid-runtime git unzip tar cron ufw python3 debian-keyring debian-archive-keyring apt-transport-https
+}
+
+install_xray() {
+  install_base_deps
+  bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) install
+  systemctl enable xray
+  green "Xray-core 安装/更新完成。"
+}
+
+install_caddy() {
+  install_base_deps
+
+  if ! command -v caddy >/dev/null 2>&1; then
+    install -d -m 0755 /etc/apt/keyrings
+    curl -fsSL "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" | gpg --dearmor -o /etc/apt/keyrings/caddy-stable-archive-keyring.gpg
+    chmod 0644 /etc/apt/keyrings/caddy-stable-archive-keyring.gpg
+    curl -fsSL "https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt" -o /etc/apt/sources.list.d/caddy-stable.list
+    chmod 0644 /etc/apt/sources.list.d/caddy-stable.list
+    apt-get update -y
+    apt-get install -y caddy
+  fi
+
+  systemctl enable caddy
+  green "Caddy 安装/更新完成。"
+}
+
+gen_reality_keys() {
+  require_xray
+
+  if [[ -n "$REALITY_PRIVATE_KEY" && -n "$REALITY_PUBLIC_KEY" && -n "$REALITY_SHORT_ID" ]]; then
+    return 0
+  fi
+
+  local output
+  output="$(xray x25519)"
+
+  REALITY_PRIVATE_KEY="$(awk -F': ' '/Private key/ {print $2}' <<< "$output")"
+  REALITY_PUBLIC_KEY="$(awk -F': ' '/Public key/ {print $2}' <<< "$output")"
+  REALITY_SHORT_ID="$(openssl rand -hex 8)"
+
+  save_state
+}
+
+urlencode_path() {
+  local raw="$1"
+  python3 - "$raw" <<'PY'
+import sys
+from urllib.parse import quote
+print(quote(sys.argv[1], safe=""))
+PY
+}
+
+public_host_for_reality() {
+  if [[ -n "$PUBLIC_HOST" ]]; then
+    echo "$PUBLIC_HOST"
+  elif [[ -n "$DOMAIN" ]]; then
+    echo "$DOMAIN"
+  else
+    curl -fs4 https://api.ipify.org || echo "YOUR_SERVER_IP"
+  fi
+}
+
+enabled_clients_json() {
+  local field="$1"
+  jq -c --arg field "$field" '
+    [
+      .users[]
+      | select(.enabled == true)
+      | select(.[$field] == true)
+      | {
+          id: .uuid,
+          email: .name,
+          level: 0
+        }
+    ]
+  ' "$USERS_FILE"
+}
+
+write_xray_config() {
+  require_xray
+  ensure_users_file
+  gen_reality_keys
+
+  local reality_clients ws_clients xhttp_tls_clients
+  reality_clients="$(enabled_clients_json reality)"
+  ws_clients="$(enabled_clients_json ws)"
+  xhttp_tls_clients="$(enabled_clients_json xhttp_tls)"
+
+  mkdir -p "$(dirname "$XRAY_CONFIG")"
+
+  jq -n \
+    --argjson reality_port "$REALITY_PORT" \
+    --argjson ws_local_port "$XRAY_LOCAL_WS_PORT" \
+    --argjson xhttp_local_port "$XRAY_LOCAL_XHTTP_PORT" \
+    --arg reality_sni "$REALITY_SNI" \
+    --arg reality_dest "$REALITY_DEST" \
+    --arg reality_private_key "$REALITY_PRIVATE_KEY" \
+    --arg reality_short_id "$REALITY_SHORT_ID" \
+    --arg ws_path "$WS_PATH" \
+    --arg xhttp_tls_path "$XHTTP_TLS_PATH" \
+    --arg reality_xhttp_path "$REALITY_XHTTP_PATH" \
+    --argjson reality_clients "$reality_clients" \
+    --argjson ws_clients "$ws_clients" \
+    --argjson xhttp_tls_clients "$xhttp_tls_clients" \
+    '{
+      log: {
+        loglevel: "warning"
+      },
+      inbounds: [
+        {
+          tag: "vless-reality-xhttp",
+          listen: "0.0.0.0",
+          port: $reality_port,
+          protocol: "vless",
+          settings: {
+            clients: $reality_clients,
+            decryption: "none"
+          },
+          streamSettings: {
+            network: "xhttp",
+            security: "reality",
+            realitySettings: {
+              show: false,
+              dest: $reality_dest,
+              xver: 0,
+              serverNames: [$reality_sni],
+              privateKey: $reality_private_key,
+              shortIds: [$reality_short_id]
+            },
+            xhttpSettings: {
+              path: $reality_xhttp_path,
+              mode: "auto"
+            },
+            sockopt: {
+              tcpFastOpen: true
+            }
+          },
+          sniffing: {
+            enabled: true,
+            destOverride: ["http", "tls", "quic"]
+          }
+        },
+        {
+          tag: "vless-ws-caddy",
+          listen: "127.0.0.1",
+          port: $ws_local_port,
+          protocol: "vless",
+          settings: {
+            clients: $ws_clients,
+            decryption: "none"
+          },
+          streamSettings: {
+            network: "ws",
+            security: "none",
+            wsSettings: {
+              path: $ws_path
+            },
+            sockopt: {
+              tcpFastOpen: true
+            }
+          },
+          sniffing: {
+            enabled: true,
+            destOverride: ["http", "tls"]
+          }
+        },
+        {
+          tag: "vless-xhttp-caddy",
+          listen: "127.0.0.1",
+          port: $xhttp_local_port,
+          protocol: "vless",
+          settings: {
+            clients: $xhttp_tls_clients,
+            decryption: "none"
+          },
+          streamSettings: {
+            network: "xhttp",
+            security: "none",
+            xhttpSettings: {
+              path: $xhttp_tls_path,
+              mode: "auto"
+            },
+            sockopt: {
+              tcpFastOpen: true
+            }
+          },
+          sniffing: {
+            enabled: true,
+            destOverride: ["http", "tls"]
+          }
+        }
+      ],
+      outbounds: [
+        {
+          tag: "direct",
+          protocol: "freedom"
+        },
+        {
+          tag: "block",
+          protocol: "blackhole"
+        }
+      ],
+      routing: {
+        domainStrategy: "AsIs",
+        rules: [
+          {
+            type: "field",
+            ip: ["geoip:private"],
+            outboundTag: "block"
+          },
+          {
+            type: "field",
+            protocol: ["bittorrent"],
+            outboundTag: "block"
+          }
+        ]
+      },
+      policy: {
+        levels: {
+          "0": {
+            handshake: 4,
+            connIdle: 300,
+            uplinkOnly: 2,
+            downlinkOnly: 5
+          }
+        }
+      }
+    }' > "$XRAY_CONFIG"
+
+  xray test -config "$XRAY_CONFIG"
+  systemctl restart xray
+  green "Xray 配置已生成并重启。"
+}
+
+install_default_site() {
+  mkdir -p "$SITE_DIR"
+  cat > "$SITE_DIR/index.html" <<'EOF'
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Welcome</title>
+  <style>
+    body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#f6f7fb;color:#202124}
+    main{max-width:760px;margin:12vh auto;padding:32px;background:#fff;border-radius:18px;box-shadow:0 12px 40px rgba(0,0,0,.08)}
+    h1{margin-top:0}
+    p{line-height:1.7;color:#5f6368}
+  </style>
+</head>
+<body>
+<main>
+  <h1>Welcome</h1>
+  <p>This site is running normally.</p>
+</main>
+</body>
+</html>
+EOF
+}
+
+pull_site_from_github() {
+  read -rp "GitHub 静态站仓库地址，例如 https://github.com/user/site.git: " SITE_REPO
+  read -rp "分支，默认 main: " input_branch
+  SITE_BRANCH="${input_branch:-main}"
+
+  if [[ -z "$SITE_REPO" ]]; then
+    red "仓库地址不能为空。"
+    return 1
+  fi
+
+  rm -rf "$SITE_DIR.tmp"
+  git clone --depth 1 -b "$SITE_BRANCH" "$SITE_REPO" "$SITE_DIR.tmp"
+
+  rm -rf "$SITE_DIR"
+  mkdir -p "$SITE_DIR"
+
+  if [[ -d "$SITE_DIR.tmp/dist" ]]; then
+    cp -a "$SITE_DIR.tmp/dist/." "$SITE_DIR/"
+  elif [[ -d "$SITE_DIR.tmp/public" ]]; then
+    cp -a "$SITE_DIR.tmp/public/." "$SITE_DIR/"
+  else
+    cp -a "$SITE_DIR.tmp/." "$SITE_DIR/"
+    rm -rf "$SITE_DIR/.git"
+  fi
+
+  rm -rf "$SITE_DIR.tmp"
+  save_state
+  green "伪装站已部署到 $SITE_DIR"
+}
+
+caddy_hash_password() {
+  caddy hash-password --plaintext "$PANEL_PASS"
+}
+
+write_caddyfile() {
+  require_domain
+  install_default_site
+
+  local hashed_pass
+  hashed_pass="$(caddy_hash_password)"
+
+  mkdir -p /etc/caddy
+
+  cat > "$CADDYFILE" <<EOF
+{
+	email ${EMAIL:-admin@$DOMAIN}
+	servers {
+		protocols h1 h2 h3
+	}
+}
+
+$DOMAIN {
+	encode zstd gzip
+
+	@ws path $WS_PATH
+	reverse_proxy @ws 127.0.0.1:$XRAY_LOCAL_WS_PORT
+
+	@xhttp path $XHTTP_TLS_PATH*
+	reverse_proxy @xhttp 127.0.0.1:$XRAY_LOCAL_XHTTP_PORT
+
+	@panel path /$SUB_TOKEN /$SUB_TOKEN/*
+	basic_auth @panel {
+		$PANEL_USER $hashed_pass
+	}
+	handle @panel {
+		root * $PANEL_DIR
+		file_server
+	}
+
+	handle {
+		root * $SITE_DIR
+		try_files {path} /index.html
+		file_server
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
+EOF
+
+  caddy validate --config "$CADDYFILE"
+  systemctl reload caddy || systemctl restart caddy
+  green "Caddy 配置已生成并重载。"
+}
+
+setup_firewall() {
+  if ! command -v ufw >/dev/null 2>&1; then
+    apt-get install -y ufw
+  fi
+
+  ufw allow 22/tcp || true
+  ufw allow 80/tcp || true
+  ufw allow 443/tcp || true
+  ufw allow "$REALITY_PORT/tcp" || true
+  ufw --force enable || true
+
+  green "防火墙已放行 22、80、443、Reality 端口 $REALITY_PORT。"
+}
+
+set_basic_info() {
+  read -rp "域名，必须已解析到本机，例如 example.com: " DOMAIN
+  read -rp "ACME 邮箱，例如 admin@example.com: " EMAIL
+  read -rp "Reality 连接地址，留空默认使用域名或公网 IP: " PUBLIC_HOST
+
+  read -rp "Reality 端口，默认 $REALITY_PORT: " input_reality_port
+  REALITY_PORT="${input_reality_port:-$REALITY_PORT}"
+
+  read -rp "Reality SNI，默认 $REALITY_SNI: " input_reality_sni
+  REALITY_SNI="${input_reality_sni:-$REALITY_SNI}"
+  REALITY_DEST="${REALITY_SNI}:443"
+
+  read -rp "WS 路径，默认 $WS_PATH: " input_ws_path
+  WS_PATH="${input_ws_path:-$WS_PATH}"
+
+  read -rp "XHTTP TLS 路径，默认 $XHTTP_TLS_PATH: " input_xhttp_tls_path
+  XHTTP_TLS_PATH="${input_xhttp_tls_path:-$XHTTP_TLS_PATH}"
+
+  read -rp "Reality XHTTP 路径，默认 $REALITY_XHTTP_PATH: " input_reality_xhttp_path
+  REALITY_XHTTP_PATH="${input_reality_xhttp_path:-$REALITY_XHTTP_PATH}"
+
+  if [[ "$WS_PATH" != /* || "$XHTTP_TLS_PATH" != /* || "$REALITY_XHTTP_PATH" != /* ]]; then
+    red "路径必须以 / 开头。"
+    return 1
+  fi
+
+  save_state
+  green "基础信息已保存。"
+}
+
+add_user() {
+  ensure_users_file
+
+  local name uuid
+  read -rp "用户名称，例如 alice: " name
+
+  if [[ -z "$name" ]]; then
+    red "用户名称不能为空。"
+    return 1
+  fi
+
+  if jq -e --arg name "$name" '.users[] | select(.name == $name)' "$USERS_FILE" >/dev/null; then
+    red "用户已存在。"
+    return 1
+  fi
+
+  uuid="$(gen_uuid)"
+
+  local reality ws xhttp_tls
+  read -rp "启用 Reality-XHTTP? [Y/n]: " reality
+  read -rp "启用 WS-TLS? [Y/n]: " ws
+  read -rp "启用 XHTTP-TLS? [Y/n]: " xhttp_tls
+
+  reality="$([[ "${reality,,}" == "n" ]] && echo false || echo true)"
+  ws="$([[ "${ws,,}" == "n" ]] && echo false || echo true)"
+  xhttp_tls="$([[ "${xhttp_tls,,}" == "n" ]] && echo false || echo true)"
+
+  local tmp
+  tmp="$(mktemp)"
+  jq \
+    --arg name "$name" \
+    --arg uuid "$uuid" \
+    --argjson reality "$reality" \
+    --argjson ws "$ws" \
+    --argjson xhttp_tls "$xhttp_tls" \
+    '.users += [{
+      name: $name,
+      uuid: $uuid,
+      enabled: true,
+      reality: $reality,
+      ws: $ws,
+      xhttp_tls: $xhttp_tls,
+      created_at: now | todate
+    }]' "$USERS_FILE" > "$tmp"
+
+  mv "$tmp" "$USERS_FILE"
+  chmod 0600 "$USERS_FILE"
+
+  write_xray_config
+  build_subscriptions
+  green "用户已添加：$name / $uuid"
+}
+
+delete_user() {
+  ensure_users_file
+  jq -r '.users[] | "\(.name)\t\(.uuid)\tenabled=\(.enabled)"' "$USERS_FILE"
+
+  local name
+  read -rp "请输入要删除的用户名称: " name
+
+  if [[ -z "$name" ]]; then
+    red "用户名称不能为空。"
+    return 1
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  jq --arg name "$name" '.users = [.users[] | select(.name != $name)]' "$USERS_FILE" > "$tmp"
+  mv "$tmp" "$USERS_FILE"
+  chmod 0600 "$USERS_FILE"
+
+  write_xray_config
+  build_subscriptions
+  green "用户已删除：$name"
+}
+
+toggle_user() {
+  ensure_users_file
+  jq -r '.users[] | "\(.name)\t\(.uuid)\tenabled=\(.enabled)"' "$USERS_FILE"
+
+  local name
+  read -rp "请输入用户名称: " name
+
+  local tmp
+  tmp="$(mktemp)"
+  jq --arg name "$name" '
+    .users = [
+      .users[]
+      | if .name == $name then .enabled = (.enabled | not) else . end
+    ]
+  ' "$USERS_FILE" > "$tmp"
+  mv "$tmp" "$USERS_FILE"
+  chmod 0600 "$USERS_FILE"
+
+  write_xray_config
+  build_subscriptions
+  green "用户状态已切换。"
+}
+
+list_users() {
+  ensure_users_file
+  jq -r '
+    .users[]
+    | "用户: \(.name)\nUUID: \(.uuid)\n启用: \(.enabled)\nReality: \(.reality)  WS: \(.ws)  XHTTP-TLS: \(.xhttp_tls)\n"
+  ' "$USERS_FILE"
+}
+
+change_ports_paths() {
+  read -rp "Reality 端口，当前 $REALITY_PORT: " input_reality_port
+  REALITY_PORT="${input_reality_port:-$REALITY_PORT}"
+
+  read -rp "WS 路径，当前 $WS_PATH: " input_ws_path
+  WS_PATH="${input_ws_path:-$WS_PATH}"
+
+  read -rp "XHTTP TLS 路径，当前 $XHTTP_TLS_PATH: " input_xhttp_tls_path
+  XHTTP_TLS_PATH="${input_xhttp_tls_path:-$XHTTP_TLS_PATH}"
+
+  read -rp "Reality XHTTP 路径，当前 $REALITY_XHTTP_PATH: " input_reality_xhttp_path
+  REALITY_XHTTP_PATH="${input_reality_xhttp_path:-$REALITY_XHTTP_PATH}"
+
+  if [[ "$WS_PATH" != /* || "$XHTTP_TLS_PATH" != /* || "$REALITY_XHTTP_PATH" != /* ]]; then
+    red "路径必须以 / 开头。"
+    return 1
+  fi
+
+  save_state
+  write_xray_config
+  write_caddyfile
+  setup_firewall
+  build_subscriptions
+}
+
+link_reality() {
+  local name="$1"
+  local uuid="$2"
+  local host path_enc tag
+  host="$(public_host_for_reality)"
+  path_enc="$(urlencode_path "$REALITY_XHTTP_PATH")"
+  tag="$(urlencode_path "xmg-reality-$name")"
+
+  echo "vless://${uuid}@${host}:${REALITY_PORT}?encryption=none&type=xhttp&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&path=${path_enc}&mode=auto#${tag}"
+}
+
+link_ws_tls() {
+  local name="$1"
+  local uuid="$2"
+  local path_enc tag
+  path_enc="$(urlencode_path "$WS_PATH")"
+  tag="$(urlencode_path "xmg-ws-$name")"
+
+  echo "vless://${uuid}@${DOMAIN}:443?encryption=none&type=ws&security=tls&sni=${DOMAIN}&host=${DOMAIN}&path=${path_enc}#${tag}"
+}
+
+link_xhttp_tls() {
+  local name="$1"
+  local uuid="$2"
+  local path_enc tag
+  path_enc="$(urlencode_path "$XHTTP_TLS_PATH")"
+  tag="$(urlencode_path "xmg-xhttp-$name")"
+
+  echo "vless://${uuid}@${DOMAIN}:443?encryption=none&type=xhttp&security=tls&sni=${DOMAIN}&host=${DOMAIN}&path=${path_enc}&mode=auto#${tag}"
+}
+
+build_subscriptions() {
+  ensure_users_file
+  gen_reality_keys || true
+
+  mkdir -p "$SUB_DIR"
+  : > "$SUB_DIR/all.txt"
+  : > "$SUB_DIR/reality.txt"
+  : > "$SUB_DIR/ws.txt"
+  : > "$SUB_DIR/xhttp-tls.txt"
+
+  while IFS=$'\t' read -r name uuid reality ws xhttp_tls; do
+    if [[ "$reality" == "true" ]]; then
+      link_reality "$name" "$uuid" | tee -a "$SUB_DIR/reality.txt" >> "$SUB_DIR/all.txt"
+    fi
+
+    if [[ -n "$DOMAIN" && "$ws" == "true" ]]; then
+      link_ws_tls "$name" "$uuid" | tee -a "$SUB_DIR/ws.txt" >> "$SUB_DIR/all.txt"
+    fi
+
+    if [[ -n "$DOMAIN" && "$xhttp_tls" == "true" ]]; then
+      link_xhttp_tls "$name" "$uuid" | tee -a "$SUB_DIR/xhttp-tls.txt" >> "$SUB_DIR/all.txt"
+    fi
+  done < <(jq -r '.users[] | select(.enabled == true) | [.name, .uuid, .reality, .ws, .xhttp_tls] | @tsv' "$USERS_FILE")
+
+  base64 -w 0 "$SUB_DIR/all.txt" > "$SUB_DIR/all.b64"
+  base64 -w 0 "$SUB_DIR/reality.txt" > "$SUB_DIR/reality.b64"
+  base64 -w 0 "$SUB_DIR/ws.txt" > "$SUB_DIR/ws.b64"
+  base64 -w 0 "$SUB_DIR/xhttp-tls.txt" > "$SUB_DIR/xhttp-tls.b64"
+
+  write_panel_html
+
+  green "订阅已生成："
+  if [[ -n "$DOMAIN" ]]; then
+    echo "面板：https://$DOMAIN/$SUB_TOKEN/"
+    echo "All：https://$DOMAIN/$SUB_TOKEN/sub/all.b64"
+    echo "Reality：https://$DOMAIN/$SUB_TOKEN/sub/reality.b64"
+    echo "WS-TLS：https://$DOMAIN/$SUB_TOKEN/sub/ws.b64"
+    echo "XHTTP-TLS：https://$DOMAIN/$SUB_TOKEN/sub/xhttp-tls.b64"
+    echo "面板账号：$PANEL_USER"
+    echo "面板密码：$PANEL_PASS"
+  else
+    echo "未设置域名，TLS 订阅链接暂不可用。"
+  fi
+}
+
+write_panel_html() {
+  local xray_status caddy_status now
+  now="$(date '+%F %T')"
+
+  if systemctl is-active --quiet xray; then
+    xray_status="running"
+  else
+    xray_status="stopped"
+  fi
+
+  if systemctl is-active --quiet caddy; then
+    caddy_status="running"
+  else
+    caddy_status="stopped"
+  fi
+
+  cat > "$PANEL_DIR/index.html" <<EOF
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>XMG Panel</title>
+  <style>
+    body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#0f172a;color:#e5e7eb}
+    main{max-width:980px;margin:40px auto;padding:24px}
+    .card{background:#111827;border:1px solid #1f2937;border-radius:16px;padding:22px;margin-bottom:18px}
+    a{color:#38bdf8;word-break:break-all}
+    code{background:#020617;padding:3px 6px;border-radius:6px}
+    .ok{color:#22c55e}.bad{color:#ef4444}
+    li{margin:10px 0}
+  </style>
+</head>
+<body>
+<main>
+  <h1>XMG Panel</h1>
+  <div class="card">
+    <p>更新时间：<code>$now</code></p>
+    <p>Xray：<span class="$([[ "$xray_status" == running ]] && echo ok || echo bad)">$xray_status</span></p>
+    <p>Caddy：<span class="$([[ "$caddy_status" == running ]] && echo ok || echo bad)">$caddy_status</span></p>
+    <p>域名：<code>${DOMAIN:-未设置}</code></p>
+    <p>Reality 端口：<code>$REALITY_PORT</code></p>
+  </div>
+
+  <div class="card">
+    <h2>订阅链接</h2>
+    <ul>
+      <li>All：<a href="./sub/all.b64">./sub/all.b64</a></li>
+      <li>Reality：<a href="./sub/reality.b64">./sub/reality.b64</a></li>
+      <li>WS-TLS：<a href="./sub/ws.b64">./sub/ws.b64</a></li>
+      <li>XHTTP-TLS：<a href="./sub/xhttp-tls.b64">./sub/xhttp-tls.b64</a></li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>管理方式</h2>
+    <p>请在服务器执行 <code>xmg</code> 使用终端管理面板添加用户、改端口、重建配置和更新订阅。</p>
+  </div>
+</main>
+</body>
+</html>
+EOF
+}
+
+show_links_for_user() {
+  ensure_users_file
+  gen_reality_keys
+
+  local name
+  read -rp "用户名称，留空显示全部: " name
+
+  jq -r --arg name "$name" '
+    .users[]
+    | select(.enabled == true)
+    | select($name == "" or .name == $name)
+    | [.name, .uuid, .reality, .ws, .xhttp_tls]
+    | @tsv
+  ' "$USERS_FILE" | while IFS=$'\t' read -r uname uuid reality ws xhttp_tls; do
+    echo
+    blue "用户：$uname"
+    if [[ "$reality" == "true" ]]; then
+      echo "Reality-XHTTP:"
+      link_reality "$uname" "$uuid"
+    fi
+    if [[ -n "$DOMAIN" && "$ws" == "true" ]]; then
+      echo "WS-TLS:"
+      link_ws_tls "$uname" "$uuid"
+    fi
+    if [[ -n "$DOMAIN" && "$xhttp_tls" == "true" ]]; then
+      echo "XHTTP-TLS:"
+      link_xhttp_tls "$uname" "$uuid"
+    fi
+  done
+}
+
+install_all() {
+  set_basic_info
+  install_xray
+  install_caddy
+  ensure_users_file
+  gen_reality_keys
+  install_default_site
+  write_xray_config
+  write_caddyfile
+  setup_firewall
+  build_subscriptions
+
+  green "初始化完成。"
+  echo "执行 xmg 可再次进入管理面板。"
+}
+
+update_all() {
+  install_xray
+  install_caddy
+  write_xray_config
+  write_caddyfile
+  build_subscriptions
+  green "更新完成。"
+}
+
+show_status() {
+  echo "XMG 版本：$XMG_VERSION"
+  echo "域名：${DOMAIN:-未设置}"
+  echo "Reality 端口：$REALITY_PORT"
+  echo "WS 路径：$WS_PATH"
+  echo "XHTTP TLS 路径：$XHTTP_TLS_PATH"
+  echo "Reality XHTTP 路径：$REALITY_XHTTP_PATH"
+  echo "订阅 Token：$SUB_TOKEN"
+  echo
+
+  systemctl status xray --no-pager -l || true
+  echo
+  systemctl status caddy --no-pager -l || true
+  echo
+  ss -lntp | grep -E "(:80|:443|:${REALITY_PORT}|:${XRAY_LOCAL_WS_PORT}|:${XRAY_LOCAL_XHTTP_PORT})\b" || true
+}
+
+view_logs() {
+  echo "1. Xray 日志"
+  echo "2. Caddy 日志"
+  read -rp "请选择: " choice
+
+  case "$choice" in
+    1) journalctl -u xray -e --no-pager ;;
+    2) journalctl -u caddy -e --no-pager ;;
+    *) red "无效选择" ;;
+  esac
+}
+
+restart_services() {
+  xray test -config "$XRAY_CONFIG"
+  systemctl restart xray
+  systemctl reload caddy || systemctl restart caddy
+  green "服务已重启。"
+}
+
+backup_config() {
+  local backup="/root/xmg-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+  tar -czf "$backup" "$BASE_DIR" "$XRAY_CONFIG" "$CADDYFILE" "$WEB_BASE" 2>/dev/null || true
+  chmod 0600 "$backup"
+  green "备份完成：$backup"
+}
+
+uninstall_xmg() {
+  yellow "此操作会卸载 XMG 配置，可选择是否卸载 Xray/Caddy。"
+  read -rp "确认继续？输入 YES: " confirm
+  [[ "$confirm" == "YES" ]] || return 0
+
+  systemctl stop xray caddy 2>/dev/null || true
+
+  read -rp "是否删除 Xray-core？[y/N]: " remove_xray
+  if [[ "${remove_xray,,}" == "y" ]]; then
+    bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) remove --purge || true
+  fi
+
+  read -rp "是否删除 Caddy？[y/N]: " remove_caddy
+  if [[ "${remove_caddy,,}" == "y" ]]; then
+    apt-get purge -y caddy || true
+  fi
+
+  rm -rf "$BASE_DIR" "$WEB_BASE"
+  rm -f /usr/local/bin/xmg
+
+  green "卸载完成。"
+}
+
+security_check() {
+  echo "基础安全检查："
+  echo "- 系统：$(. /etc/os-release && echo "${PRETTY_NAME:-unknown}")"
+  echo "- Xray：$(command -v xray >/dev/null && xray version | head -n1 || echo 未安装)"
+  echo "- Caddy：$(command -v caddy >/dev/null && caddy version || echo 未安装)"
+  echo "- state 权限：$(stat -c '%a %n' "$STATE_FILE" 2>/dev/null || echo 未生成)"
+  echo "- users 权限：$(stat -c '%a %n' "$USERS_FILE" 2>/dev/null || echo 未生成)"
+  echo "- 防火墙：$(ufw status 2>/dev/null | head -n1 || echo 未安装)"
+  echo "- 开放端口："
+  ss -lntp | awk 'NR==1 || /:80|:443|:8443|:10001|:10002/'
+}
+
+menu() {
+  clear || true
+  blue "XMG - Xray Manager $XMG_VERSION"
+  echo
+  echo "1.  一键初始化 / 安装"
+  echo "2.  设置域名、路径、Reality 参数"
+  echo "3.  安装 / 更新 Xray-core"
+  echo "4.  安装 / 更新 Caddy"
+  echo "5.  生成 / 重建 Xray 配置"
+  echo "6.  生成 / 重载 Caddy 配置"
+  echo "7.  添加用户"
+  echo "8.  删除用户"
+  echo "9.  启用 / 禁用用户"
+  echo "10. 查看用户"
+  echo "11. 修改端口和路径"
+  echo "12. 生成订阅和面板"
+  echo "13. 查看单用户链接"
+  echo "14. 从 GitHub 拉取伪装站"
+  echo "15. 查看服务状态"
+  echo "16. 查看日志"
+  echo "17. 重启服务"
+  echo "18. 防火墙放行"
+  echo "19. 备份配置"
+  echo "20. 安全检查"
+  echo "21. 更新全部组件"
+  echo "99. 卸载"
+  echo "0.  退出"
+  echo
+}
+
+main_loop() {
+  while true; do
+    menu
+    read -rp "请选择: " choice
+
+    case "$choice" in
+      1) install_all; pause ;;
+      2) set_basic_info; pause ;;
+      3) install_xray; pause ;;
+      4) install_caddy; pause ;;
+      5) write_xray_config; pause ;;
+      6) write_caddyfile; pause ;;
+      7) add_user; pause ;;
+      8) delete_user; pause ;;
+      9) toggle_user; pause ;;
+      10) list_users; pause ;;
+      11) change_ports_paths; pause ;;
+      12) build_subscriptions; pause ;;
+      13) show_links_for_user; pause ;;
+      14) pull_site_from_github; write_caddyfile; pause ;;
+      15) show_status; pause ;;
+      16) view_logs; pause ;;
+      17) restart_services; pause ;;
+      18) setup_firewall; pause ;;
+      19) backup_config; pause ;;
+      20) security_check; pause ;;
+      21) update_all; pause ;;
+      99) uninstall_xmg; exit 0 ;;
+      0) exit 0 ;;
+      *) red "无效选项"; pause ;;
+    esac
+  done
+}
+
+main() {
+  need_root
+  detect_os
+  init_dirs
+  load_state
+  save_state
+  ensure_users_file
+
+  if [[ "${1:-}" == "install" ]]; then
+    install_all
+    exit 0
+  fi
+
+  if [[ "${1:-}" == "status" ]]; then
+    show_status
+    exit 0
+  fi
+
+  if [[ "${1:-}" == "links" ]]; then
+    show_links_for_user
+    exit 0
+  fi
+
+  if [[ "${1:-}" == "sub" ]]; then
+    build_subscriptions
+    exit 0
+  fi
+
+  main_loop
+}
+
+main "$@"
