@@ -1,6 +1,6 @@
 {
   "log": {
-    "loglevel": "warning",
+    "loglevel": "warning"
   },
   "dns": {
     "servers": [
@@ -25,17 +25,7 @@
             "pass": "REPLACE_WITH_STRONG_PASSWORD"
           }
         ],
-        "udp": false,
-        "ip": "127.0.0.1"
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": [
-          "http",
-          "tls",
-          "quic"
-        ],
-        "routeOnly": true
+        "udp": false
       }
     }
   ],
@@ -71,17 +61,15 @@
       {
         "type": "field",
         "ip": [
+          "geoip:private",
+          "127.0.0.0/8",
+          "::1/128",
           "geoip:cn",
           "geoip:ir",
           "geoip:in",
           "geoip:ru"
         ],
         "outboundTag": "block"
-      },
-      {
-        "type": "field",
-        "outboundTag": "direct",
-        "network": "tcp"
       }
     ]
   }
