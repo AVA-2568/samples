@@ -25,7 +25,7 @@
         "geosite:cn"
       ],
       // 要求返回的 IP 属于中国 IP 段，否则视为不合格，继续后面的 fallback
-      "expectIPs": [
+      "expectedIPs": [
         "geoip:cn"
       ],
       "skipFallback": true
