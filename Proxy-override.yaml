@@ -34,7 +34,7 @@ profile:
 geox-url:
   geosite: https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat
   geoip: https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat
-  geoip-mmdb: https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb
+  mmdb: https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb
 
 # ================================================================
 #  端口 / SOCKS / 混合入站
@@ -73,9 +73,9 @@ sniffer:
     - +.apple.com
 
 # ================================================================
-#  DNS 极简配置
-#  国内 → https://doh.pub/dns-query
-#  国外 → https://dns.google/dns-query
+#  DNS 安全配置（方案 B：分离直连 DNS 与代理 DNS）
+#  直连 DNS → DoH.Pub / AliDNS（国内解析，无泄露）
+#  代理 DNS → Google DNS（经代理隧道发出，不暴露真实 IP）
 #  default-nameserver 仅用于 bootstrap 解析 DNS 服务器自身 IP
 # ================================================================
 
@@ -132,10 +132,15 @@ dns:
   default-nameserver:
     - tls://223.5.5.5
     - tls://223.6.6.6
-  # 国外 DNS（走代理解析）
+  # 直连 DNS（国内解析，所有 DIRECT 流量的 DNS 查询走此处）
   nameserver:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+  # 代理 DNS（仅用于代理节点的 DNS 查询，经代理隧道发出）
+  # Google DNS 永远不会直连发出，ISP 无法窥探代理目标
+  proxy-server-nameserver:
     - https://dns.google/dns-query
-  # 国内域名走国内 DNS（nameserver-policy 优先于 nameserver）
+  # 国内域名显式路由（冗余配置，确保 nameserver 兜底正确）
   nameserver-policy:
     geosite:cn,geolocation-cn,bilibili,biliintl:
       - https://doh.pub/dns-query
