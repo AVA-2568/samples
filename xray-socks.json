@@ -1,76 +1,134 @@
 {
   "log": {
-    "loglevel": "warning"
+    "access": "none",
+    "error": "warning",
+    "loglevel": "warning",
+    "dnsLog": false
   },
+
   "dns": {
     "servers": [
-      {
-        "address": "https+local://8.8.8.8/dns-query",
-        "skipFallback": true
-      }
+      // DoH 本地模式，适合服务端。
+      // 使用 IP 形式可避免解析 DoH 域名时产生额外依赖。
+      "https+local://1.1.1.1/dns-query",
+
+      // 第一台 DoH 不可用时作为回退。
+      "https+local://8.8.8.8/dns-query"
     ],
-    "queryStrategy": "UseIP"
+
+    // 同时查询 A 和 AAAA 记录。
+    "queryStrategy": "UseIP",
+
+    // 保留 DNS 缓存，降低重复解析开销。
+    "disableCache": false,
+
+    // 不使用系统 hosts，避免系统 hosts 意外改变代理解析结果。
+    "useSystemHosts": false
   },
+
   "inbounds": [
     {
-      "tag": "socks-in",
+      // 如果服务器有固定公网地址，建议改成具体地址；
+      // 0.0.0.0 表示监听所有 IPv4 网卡。
       "listen": "0.0.0.0",
-      "port": 25365,
+      "port": 1080,
       "protocol": "socks",
+      "tag": "socks-in",
+
       "settings": {
         "auth": "password",
-        "accounts": [
+
+        "users": [
           {
-            "user": "REPLACE_WITH_USERNAME",
-            "pass": "REPLACE_WITH_STRONG_PASSWORD"
+            "user": "replace-with-your-username",
+            "pass": "replace-with-a-long-random-password"
           }
         ],
-        "udp": false
+
+        // 关闭 SOCKS UDP，减少暴露面并仅提供 TCP 代理。
+        "udp": false,
+
+        "userLevel": 0
       }
     }
   ],
-  "outbounds": [
-    {
-      "tag": "direct",
-      "protocol": "freedom",
-      "settings": {
-        "domainStrategy": "UseIP"
-      }
-    },
-    {
-      "tag": "block",
-      "protocol": "blackhole",
-      "settings": {
-        "response": {
-          "type": "none"
-        }
-      }
-    }
-  ],
+
   "routing": {
-    "domainStrategy": "IPIfNonMatch",
+    // 遇到 IP 规则时解析域名，以便按 GeoIP 规则匹配域名目标。
+    "domainStrategy": "IPOnDemand",
+
     "rules": [
       {
-        "type": "field",
-        "inboundTag": [
-          "socks-in"
-        ],
-        "network": "udp",
-        "outboundTag": "block"
-      },
-      {
-        "type": "field",
-        "ip": [
-          "geoip:private",
-          "127.0.0.0/8",
-          "::1/128",
+        // 第一层：禁止来源 IP 属于中国、伊朗、印度、俄罗斯的客户端。
+        "inboundTag": ["socks-in"],
+        "sourceIP": [
           "geoip:cn",
           "geoip:ir",
           "geoip:in",
           "geoip:ru"
         ],
         "outboundTag": "block"
+      },
+
+      {
+        // 第二层：禁止访问位于中国、伊朗、印度、俄罗斯的目标 IP。
+        "inboundTag": ["socks-in"],
+        "ip": [
+          "geoip:cn",
+          "geoip:ir",
+          "geoip:in",
+          "geoip:ru"
+        ],
+        "outboundTag": "block"
+      },
+
+      {
+        // 其他 SOCKS 流量进入直连出口。
+        "inboundTag": ["socks-in"],
+        "outboundTag": "direct"
       }
     ]
-  }
+  },
+
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct",
+
+      "settings": {
+        // 使用 Xray 内置 DNS 解析代理目标。
+        "domainStrategy": "UseIP",
+
+        // 最终拨号前再次检查目标 IP。
+        // 即使路由阶段未成功匹配，也不会放行这些国家的目标。
+        "finalRules": [
+          {
+            "action": "block",
+            "ip": [
+              "geoip:cn",
+              "geoip:ir",
+              "geoip:in",
+              "geoip:ru"
+            ]
+          },
+
+          // 仅允许 TCP，和 SOCKS 入站的 udp:false 保持一致。
+          {
+            "action": "allow",
+            "network": "tcp"
+          }
+        ]
+      }
+    },
+
+    {
+      "protocol": "blackhole",
+      "tag": "block",
+      "settings": {
+        "response": {
+          "type": "none"
+        }
+      }
+    }
+  ]
 }
