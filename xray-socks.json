@@ -1,51 +1,56 @@
 {
   "log": {
     "access": "none",
-    "error": "warning",
+    "error": "",
     "loglevel": "warning",
     "dnsLog": false
   },
 
   "dns": {
     "servers": [
-      // DoH 本地模式，适合服务端。
-      // 使用 IP 形式可避免解析 DoH 域名时产生额外依赖。
+      // DoH local mode (DOHL): queries bypass the routing component and go out
+      // directly via the Freedom outbound; docs recommend it for servers.
+      // IP form avoids extra DNS dependency for resolving the DoH domain.
       "https+local://1.1.1.1/dns-query",
 
-      // 第一台 DoH 不可用时作为回退。
+      // Fallback when the first server is unavailable.
       "https+local://8.8.8.8/dns-query"
     ],
 
-    // 同时查询 A 和 AAAA 记录。
-    "queryStrategy": "UseIP",
+    // A records only: avoids AAAA dial attempts on hosts without public IPv6.
+    // Switch back to "UseIP" if the server has IPv6 egress.
+    "queryStrategy": "UseIPv4",
 
-    // 保留 DNS 缓存，降低重复解析开销。
+    // Keep DNS cache; optimistic stale serving: return expired record at once
+    // and refresh in background. Stale records usable for at most 1 hour.
     "disableCache": false,
+    "serveStale": true,
+    "serveExpiredTTL": 3600,
 
-    // 不使用系统 hosts，避免系统 hosts 意外改变代理解析结果。
+    // Ignore system hosts so it cannot alter proxy resolution.
     "useSystemHosts": false
   },
 
   "inbounds": [
     {
-      // 如果服务器有固定公网地址，建议改成具体地址；
-      // 0.0.0.0 表示监听所有 IPv4 网卡。
+      // Per docs "0.0.0.0" equals "::" and listens on both IPv4 and IPv6.
       "listen": "0.0.0.0",
-      "port": 1080,
+      "port": 25365,
       "protocol": "socks",
       "tag": "socks-in",
 
       "settings": {
         "auth": "password",
 
+        // Strong random credentials. Rotate on leak; keep clients in sync.
         "users": [
           {
-            "user": "replace-with-your-username",
-            "pass": "replace-with-a-long-random-password"
+            "user": "proxy_user_7Kp4",
+            "pass": "vN8qL2zR6mT4xP9sH7cW3dF5"
           }
         ],
 
-        // 关闭 SOCKS UDP，减少暴露面并仅提供 TCP 代理。
+        // TCP proxy only.
         "udp": false,
 
         "userLevel": 0
@@ -54,15 +59,14 @@
   ],
 
   "routing": {
-    // 遇到 IP 规则时解析域名，以便按 GeoIP 规则匹配域名目标。
+    // Resolve domains when an IP rule is hit, so domain targets also match GeoIP bans.
     "domainStrategy": "IPOnDemand",
 
     "rules": [
       {
-        // 第一层：禁止来源 IP 属于中国、伊朗、印度、俄罗斯的客户端。
+        // Layer 1: block clients from  IR / IN / RU.
         "inboundTag": ["socks-in"],
         "sourceIP": [
-          "geoip:cn",
           "geoip:ir",
           "geoip:in",
           "geoip:ru"
@@ -71,9 +75,12 @@
       },
 
       {
-        // 第二层：禁止访问位于中国、伊朗、印度、俄罗斯的目标 IP。
+        // Layer 2: block private/reserved targets (SSRF, cloud metadata)
+        // and the four countries.
         "inboundTag": ["socks-in"],
         "ip": [
+          "geoip:private",
+          "169.254.0.0/16",
           "geoip:cn",
           "geoip:ir",
           "geoip:in",
@@ -83,7 +90,7 @@
       },
 
       {
-        // 其他 SOCKS 流量进入直连出口。
+        // Everything else from SOCKS goes to the direct outbound.
         "inboundTag": ["socks-in"],
         "outboundTag": "direct"
       }
@@ -96,12 +103,22 @@
       "tag": "direct",
 
       "settings": {
-        // 使用 Xray 内置 DNS 解析代理目标。
-        "domainStrategy": "UseIP",
+        // Resolve proxy targets via Xray built-in DNS, A records only.
+        "domainStrategy": "UseIPv4",
 
-        // 最终拨号前再次检查目标 IP。
-        // 即使路由阶段未成功匹配，也不会放行这些国家的目标。
+        // Final check before dialing. Docs: traffic matching no explicit rule
+        // falls back to the built-in default policy, and SOCKS counts as
+        // "other traffic: allow all". The last rule blocks all UDP so the
+        // default fallback can never apply.
         "finalRules": [
+          {
+            "action": "block",
+            "ip": [
+              "geoip:private",
+              "169.254.0.0/16"
+            ]
+          },
+
           {
             "action": "block",
             "ip": [
@@ -112,10 +129,15 @@
             ]
           },
 
-          // 仅允许 TCP，和 SOCKS 入站的 udp:false 保持一致。
+          // TCP only, consistent with udp:false on the SOCKS inbound.
           {
             "action": "allow",
             "network": "tcp"
+          },
+
+          {
+            "action": "block",
+            "network": "udp"
           }
         ]
       }
