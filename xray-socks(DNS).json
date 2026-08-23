@@ -1,0 +1,62 @@
+{
+  "log": {
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
+    "loglevel": "warning",
+    "dnsLog": false // 排障期改 true：可见每次解析的上游、结果、耗时；长期开启增大日志量
+  },
+  // 内置 DNS 块：只有当出站 domainStrategy 非 AsIs 时才参与解析（见下方 freedom 联动）
+  "dns": {
+    "servers": [
+      // 主/备两条 DOHL：按顺序尝试，主失败自动回退备
+      // 用 IP 形式 DoH：不经路由组件直连出站、上游自身无域名解析依赖（防回环）
+      "https+local://1.1.1.1/dns-query",
+      "https+local://8.8.8.8/dns-query"
+    ],
+    "queryStrategy": "UseSystem", // 自适应：启动时探测有无 IPv6 默认网关，有才查 AAAA；强制 v4 改 "UseIPv4"
+    "serveStale": true // 乐观缓存：记录过期先返回旧值、后台刷新，降低重复访问延迟
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0", // 仅本机使用改 "127.0.0.1"
+      "port": 53462, // 必改：避开常见扫描端口
+      "protocol": "socks",
+      "settings": {
+        "auth": "password", // 公网必须认证
+        "users": [
+          { "user": "your-username", "pass": "your-strong-password" } // 必改
+        ],
+        "udp": false // 开 UDP 需同级加 "ip": "本机公网IP"
+      },
+      "tag": "socks-in"
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIP", // 由 AsIs 改为此值，内置 DNS 才接管解析；实际地址族与 queryStrategy 取交集
+        "finalRules": [
+          // 防滥用：阻断回环 SSH 及邮件出站端口，可按需删
+          { "action": "block", "port": "22,25,465,587" },
+          // 安全兜底：解析后的最终 IP 也要过这里，即使解析被污染指向内网同样拦下
+          {
+            "action": "block",
+            "network": "tcp,udp",
+            "ip": [
+              "geoip:private",
+              "0.0.0.0/8",
+              "100.64.0.0/10",
+              "169.254.0.0/16",
+              "198.18.0.0/15",
+              "224.0.0.0/3",
+              "fc00::/7",
+              "fe80::/10"
+            ]
+          }
+        ]
+      },
+      "tag": "direct"
+    }
+  ]
+}
