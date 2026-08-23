@@ -1,156 +1,54 @@
 {
+  // 日志：排障用；磁盘紧张时 access 可改为 "none" 关闭
   "log": {
-    "access": "none",
-    "error": "",
-    "loglevel": "warning",
-    "dnsLog": false
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
+    "loglevel": "warning"
   },
-
-  "dns": {
-    "servers": [
-      // DoH local mode (DOHL): queries bypass the routing component and go out
-      // directly via the Freedom outbound; docs recommend it for servers.
-      // IP form avoids extra DNS dependency for resolving the DoH domain.
-      "https+local://1.1.1.1/dns-query",
-
-      // Fallback when the first server is unavailable.
-      "https+local://8.8.8.8/dns-query"
-    ],
-
-    // A records only: avoids AAAA dial attempts on hosts without public IPv6.
-    // Switch back to "UseIP" if the server has IPv6 egress.
-    "queryStrategy": "UseIPv4",
-
-    // Keep DNS cache; optimistic stale serving: return expired record at once
-    // and refresh in background. Stale records usable for at most 1 hour.
-    "disableCache": false,
-    "serveStale": true,
-    "serveExpiredTTL": 3600,
-
-    // Ignore system hosts so it cannot alter proxy resolution.
-    "useSystemHosts": false
-  },
-
   "inbounds": [
     {
-      // Per docs "0.0.0.0" equals "::" and listens on both IPv4 and IPv6.
-      "listen": "0.0.0.0",
-      "port": 25365,
+      "listen": "0.0.0.0", // 对外服务；仅本机使用改 "127.0.0.1"
+      "port": 1080, // 必改：避开 1080 等常见扫描端口
       "protocol": "socks",
-      "tag": "socks-in",
-
       "settings": {
-        "auth": "password",
-
-        // Strong random credentials. Rotate on leak; keep clients in sync.
+        "auth": "password", // 公网必须密码认证；"noauth" 为匿名，严禁公网使用
         "users": [
           {
-            "user": "proxy_user_7Kp4",
-            "pass": "vN8qL2zR6mT4xP9sH7cW3dF5"
+            "user": "your-username", // 必改
+            "pass": "your-strong-password" // 必改：强随机密码
           }
         ],
-
-        // TCP proxy only.
-        "udp": false,
-
-        "userLevel": 0
-      }
+        "udp": false // 需 UDP（DNS/游戏）改 true，并在同级加 "ip": "本机公网IP"（NAT 环境必须）
+      },
+      "tag": "socks-in"
     }
   ],
-
-  "routing": {
-    // Resolve domains when an IP rule is hit, so domain targets also match GeoIP bans.
-    "domainStrategy": "IPOnDemand",
-
-    "rules": [
-      {
-        // Layer 1: block clients from  IR / IN / RU.
-        "inboundTag": ["socks-in"],
-        "sourceIP": [
-          "geoip:ir",
-          "geoip:in",
-          "geoip:ru"
-        ],
-        "outboundTag": "block"
-      },
-
-      {
-        // Layer 2: block private/reserved targets (SSRF, cloud metadata)
-        // and the four countries.
-        "inboundTag": ["socks-in"],
-        "ip": [
-          "geoip:private",
-          "169.254.0.0/16",
-          "geoip:cn",
-          "geoip:ir",
-          "geoip:in",
-          "geoip:ru"
-        ],
-        "outboundTag": "block"
-      },
-
-      {
-        // Everything else from SOCKS goes to the direct outbound.
-        "inboundTag": ["socks-in"],
-        "outboundTag": "direct"
-      }
-    ]
-  },
-
   "outbounds": [
     {
       "protocol": "freedom",
-      "tag": "direct",
-
       "settings": {
-        // Resolve proxy targets via Xray built-in DNS, A records only.
-        "domainStrategy": "UseIPv4",
-
-        // Final check before dialing. Docs: traffic matching no explicit rule
-        // falls back to the built-in default policy, and SOCKS counts as
-        // "other traffic: allow all". The last rule blocks all UDP so the
-        // default fallback can never apply.
+        "domainStrategy": "AsIs",
         "finalRules": [
+          // 防滥用：阻断回环打本机 SSH 及垃圾邮件出站端口；有需要可删此条
+          { "action": "block", "port": "22,25,465,587" },
+          // 安全兜底：禁止访问私有/保留地址（防探测 VPS 内网与云元数据 169.254.169.254）
           {
             "action": "block",
+            "network": "tcp,udp",
             "ip": [
               "geoip:private",
-              "169.254.0.0/16"
+              "0.0.0.0/8",
+              "100.64.0.0/10",
+              "169.254.0.0/16",
+              "198.18.0.0/15",
+              "224.0.0.0/3",
+              "fc00::/7",
+              "fe80::/10"
             ]
-          },
-
-          {
-            "action": "block",
-            "ip": [
-              "geoip:cn",
-              "geoip:ir",
-              "geoip:in",
-              "geoip:ru"
-            ]
-          },
-
-          // TCP only, consistent with udp:false on the SOCKS inbound.
-          {
-            "action": "allow",
-            "network": "tcp"
-          },
-
-          {
-            "action": "block",
-            "network": "udp"
           }
         ]
-      }
-    },
-
-    {
-      "protocol": "blackhole",
-      "tag": "block",
-      "settings": {
-        "response": {
-          "type": "none"
-        }
-      }
+      },
+      "tag": "direct" // 第一个 outbound 即默认出站
     }
   ]
 }
